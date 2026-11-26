@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["safetensors", "torch", "transformers==4.57.6"]
 # ///
-"""Turn plain text into Qwen3-8B's input embeddings."""
+"""Prepare Qwen3-8B's input for attention in decoder block 0."""
 
 import argparse
 import json
@@ -13,20 +13,36 @@ from safetensors import safe_open
 from transformers import AutoTokenizer
 
 EMBEDDING_WEIGHT = "model.embed_tokens.weight"
+BLOCK0_NORM_WEIGHT = "model.layers.0.input_layernorm.weight"
 
 
-class Qwen3Input:
+def load_weight(checkpoint_dir: Path, weight_map: dict[str, str], name: str) -> torch.Tensor:
+    with safe_open(checkpoint_dir / weight_map[name], framework="pt", device="cpu") as shard:
+        return shard.get_tensor(name)
+
+
+def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    values = hidden_states.float()
+    mean_square = values.square().mean(dim=-1, keepdim=True)
+    normalized = values * torch.rsqrt(mean_square + eps)
+    return weight * normalized.to(hidden_states.dtype)
+
+
+class Qwen3Input(torch.nn.Module):
     def __init__(self, checkpoint_dir: Path):
+        super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(
             checkpoint_dir, local_files_only=True
         )
-        index = json.loads(
+        config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+        self.rms_norm_eps = config["rms_norm_eps"]
+        weight_map = json.loads(
             (checkpoint_dir / "model.safetensors.index.json").read_text(encoding="utf-8")
-        )
-        shard_path = checkpoint_dir / index["weight_map"][EMBEDDING_WEIGHT]
-        with safe_open(shard_path, framework="pt", device="cpu") as shard:
-            weight = shard.get_tensor(EMBEDDING_WEIGHT)
-        self.embedding = torch.nn.Embedding.from_pretrained(weight)
+        )["weight_map"]
+        embedding_weight = load_weight(checkpoint_dir, weight_map, EMBEDDING_WEIGHT)
+        self.embedding = torch.nn.Embedding.from_pretrained(embedding_weight)
+        norm_weight = load_weight(checkpoint_dir, weight_map, BLOCK0_NORM_WEIGHT)
+        self.block0_norm_weight = torch.nn.Parameter(norm_weight, requires_grad=False)
 
     def encode_text(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
@@ -37,6 +53,10 @@ class Qwen3Input:
         )
         return self.embedding(input_ids)
 
+    def forward(self, token_ids: list[int]) -> torch.Tensor:
+        embeddings = self.embed_tokens(token_ids)
+        return rms_norm(embeddings, self.block0_norm_weight, self.rms_norm_eps)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -46,10 +66,7 @@ def main() -> None:
 
     model_input = Qwen3Input(args.checkpoint_dir)
     token_ids = model_input.encode_text(args.text)
-    embeddings = model_input.embed_tokens(token_ids)
-    if token_ids:
-        first_row = model_input.embedding.weight[token_ids[0]]
-        torch.testing.assert_close(embeddings[0, 0], first_row, rtol=0, atol=0)
+    model_input(token_ids)
 
 
 if __name__ == "__main__":
